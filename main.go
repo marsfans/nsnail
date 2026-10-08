@@ -1,16 +1,19 @@
 // nsnali: nslookup + nali 合体工具
 //
 // 用法:
-//   nsnali [-s 223.5.5.5] [-t A,AAAA,CNAME,MX,NS,TXT] 域名...   // 解析并标注 IP 归属地
-//   dig www.qq.com | nsnali                                       // nali 模式：给文本里的 IP 加注释
-//   nsnali 8.8.8.8 240e::1                                        // 参数是 IP 时直接查归属地
+//
+//	nsnali [-s 223.5.5.5] [-t A,AAAA,CNAME,MX,NS,TXT] 域名...   // 解析并标注 IP 归属地
+//	dig www.qq.com | nsnali                                       // nali 模式：给文本里的 IP 加注释
+//	nsnali 8.8.8.8 240e::1                                        // 参数是 IP 时直接查归属地
 package main
 
 import (
 	"bufio"
 	"flag"
 	"fmt"
+	"io"
 	"net"
+	"net/http"
 	"os"
 	"path/filepath"
 	"regexp"
@@ -111,15 +114,127 @@ func naliMode() {
 	}
 }
 
-// 默认在可执行文件同目录、当前目录查找 xdb
-func defaultDB(name string) string {
+// IP 库下载源：优先 jsDelivr CDN 各节点，最后回退 GitHub 原始地址。
+// 注：jsDelivr 对 GitHub 文件有 20MB 上限，v6 库（约 37MB）会被拒绝，自动走回退。
+var mirrors = []string{
+	"https://cdn.jsdelivr.net/gh/lionsoul2014/ip2region@master/data/",
+	"https://fastly.jsdelivr.net/gh/lionsoul2014/ip2region@master/data/",
+	"https://gcore.jsdelivr.net/gh/lionsoul2014/ip2region@master/data/",
+	"https://testingcf.jsdelivr.net/gh/lionsoul2014/ip2region@master/data/",
+	"https://raw.githubusercontent.com/lionsoul2014/ip2region/master/data/",
+}
+
+// selfMirror 自建镜像（如你的 Caddy 文件服务器），排在最前面。
+// 三种设置方式，优先级从高到低：-mirror 参数 > NSNALI_MIRROR 环境变量 > 编译时注入：
+//
+//	go build -ldflags "-X main.selfMirror=https://files.example.com/nsnali/" .
+var selfMirror = ""
+
+func mirrorList(flagVal string) []string {
+	m := flagVal
+	if m == "" {
+		m = os.Getenv("NSNALI_MIRROR")
+	}
+	if m == "" {
+		m = selfMirror
+	}
+	if m == "" {
+		return mirrors
+	}
+	if !strings.HasSuffix(m, "/") {
+		m += "/"
+	}
+	return append([]string{m}, mirrors...)
+}
+
+// dataDir 返回 IP 库存放目录：~/.cache/nsnali（Windows 为 %LocalAppData%\nsnali）
+func dataDir() string {
+	if d, err := os.UserCacheDir(); err == nil {
+		return filepath.Join(d, "nsnali")
+	}
+	return "."
+}
+
+// findDB 依次在可执行文件目录、当前目录、缓存目录查找 xdb，都没有则返回缓存目录路径
+func findDB(name string) string {
+	var dirs []string
 	if exe, err := os.Executable(); err == nil {
-		p := filepath.Join(filepath.Dir(exe), name)
-		if _, err := os.Stat(p); err == nil {
+		dirs = append(dirs, filepath.Dir(exe))
+	}
+	dirs = append(dirs, ".", dataDir())
+	for _, d := range dirs {
+		p := filepath.Join(d, name)
+		if fi, err := os.Stat(p); err == nil && fi.Size() > 0 {
 			return p
 		}
 	}
-	return name
+	return filepath.Join(dataDir(), name)
+}
+
+// download 按镜像顺序下载到 dst，先写临时文件，完整后再改名
+func download(name, dst string, srcs []string) error {
+	if err := os.MkdirAll(filepath.Dir(dst), 0o755); err != nil {
+		return err
+	}
+	client := &http.Client{Timeout: 10 * time.Minute}
+	var lastErr error
+	skipJSD := false
+	for _, base := range srcs {
+		isJSD := strings.Contains(base, "jsdelivr.net")
+		if isJSD && skipJSD {
+			continue
+		}
+		url := base + name
+		fmt.Fprintf(os.Stderr, "下载 %s ... ", url)
+		resp, err := client.Get(url)
+		if err != nil {
+			lastErr = err
+			fmt.Fprintln(os.Stderr, "失败:", err)
+			continue
+		}
+		if resp.StatusCode != http.StatusOK {
+			resp.Body.Close()
+			if isJSD && resp.StatusCode == http.StatusForbidden {
+				skipJSD = true // 超过 jsDelivr 20MB 限制，其他节点同样会拒绝
+			}
+			lastErr = fmt.Errorf("HTTP %d", resp.StatusCode)
+			fmt.Fprintln(os.Stderr, "失败:", lastErr)
+			continue
+		}
+		tmp := dst + ".part"
+		f, err := os.Create(tmp)
+		if err != nil {
+			resp.Body.Close()
+			return err
+		}
+		n, err := io.Copy(f, resp.Body)
+		resp.Body.Close()
+		f.Close()
+		if err != nil || (resp.ContentLength > 0 && n != resp.ContentLength) {
+			os.Remove(tmp)
+			lastErr = fmt.Errorf("下载不完整: %v", err)
+			fmt.Fprintln(os.Stderr, "失败:", lastErr)
+			continue
+		}
+		if err := os.Rename(tmp, dst); err != nil {
+			return err
+		}
+		fmt.Fprintf(os.Stderr, "完成 (%.1f MB)\n", float64(n)/1024/1024)
+		return nil
+	}
+	return fmt.Errorf("所有下载源均失败: %v", lastErr)
+}
+
+// ensureDB 文件不存在（或要求更新）时自动下载
+func ensureDB(path, name string, update bool, srcs []string) {
+	if !update {
+		if fi, err := os.Stat(path); err == nil && fi.Size() > 0 {
+			return
+		}
+	}
+	if err := download(name, path, srcs); err != nil {
+		fmt.Fprintf(os.Stderr, "%s 下载失败: %v\n", name, err)
+	}
 }
 
 func parseTypes(s string) []uint16 {
@@ -140,8 +255,11 @@ func loadIP2Region(v4, v6 string) {
 		fmt.Fprintln(os.Stderr, "加载 IPv4 库失败:", err)
 		return
 	}
-	v6cfg, err := service.NewV6Config(service.BufferCache, v6, 1)
-	if err != nil {
+	var v6cfg *service.Config
+	if v6 != "" {
+		v6cfg, err = service.NewV6Config(service.BufferCache, v6, 1)
+	}
+	if v6 != "" && err != nil {
 		fmt.Fprintln(os.Stderr, "加载 IPv6 库失败（仅 IPv4 可用）:", err)
 		v6cfg = nil
 	}
@@ -156,9 +274,24 @@ func main() {
 	server := flag.String("s", "223.5.5.5", "DNS 服务器，可带端口，如 8.8.8.8:53")
 	qtypes := flag.String("t", "A,AAAA", "查询的记录类型，逗号分隔")
 	timeout := flag.Duration("timeout", 3*time.Second, "查询超时")
-	v4db := flag.String("v4", defaultDB("ip2region_v4.xdb"), "IPv4 xdb 路径")
-	v6db := flag.String("v6", defaultDB("ip2region_v6.xdb"), "IPv6 xdb 路径")
+	v4db := flag.String("v4", findDB("ip2region_v4.xdb"), "IPv4 xdb 路径（不存在则自动下载）")
+	v6db := flag.String("v6", findDB("ip2region_v6.xdb"), "IPv6 xdb 路径（不存在则自动下载）")
+	update := flag.Bool("update", false, "重新下载 IP 库后退出")
+	noV6 := flag.Bool("no-v6", false, "不使用 IPv6 库（省去约 37MB 下载）")
+	mirror := flag.String("mirror", "", "自建 IP 库下载地址（目录 URL），优先于 jsDelivr")
 	flag.Parse()
+
+	srcs := mirrorList(*mirror)
+	ensureDB(*v4db, "ip2region_v4.xdb", *update, srcs)
+	if !*noV6 {
+		ensureDB(*v6db, "ip2region_v6.xdb", *update, srcs)
+	}
+	if *update {
+		return
+	}
+	if *noV6 {
+		*v6db = ""
+	}
 
 	loadIP2Region(*v4db, *v6db)
 	if ip2r != nil {
