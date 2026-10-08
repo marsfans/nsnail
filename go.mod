@@ -1,4 +1,4 @@
-module github.com/marsfans/nsnali
+module github.com/marsfans/nsnail
 
 go 1.25.0
 
