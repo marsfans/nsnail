@@ -26,6 +26,10 @@ jsDelivr 单文件限 20MB，v6 库约 37MB 会被拒，自动回退 GitHub。
     ./nsnali -update                        # 重新下载 IP 库
     ./nsnali -no-v6 qq.com                  # 只用 IPv4 库，免下 37MB
 
+## 发布
+Actions → Release → Run workflow，填版本号（如 v1.1.0），更新内容留空即自动取上个版本以来的提交说明，自动编译 Linux/Windows/macOS 的 amd64、arm64 并发布到同名 Release。
+可在仓库 Settings → Variables 设 `NSNALI_MIRROR`，编译时注入自建 IP 库镜像。
+
 ## 更新日志
 - v1.1.0：IP 库自动下载（jsDelivr CDN 加速 + GitHub 回退）、自建镜像（-mirror / NSNALI_MIRROR / ldflags）、-update、-no-v6
 - v1.0.0：nslookup + nali，支持 A/AAAA/CNAME/MX/NS/TXT、截断转 TCP、nali 管道模式
