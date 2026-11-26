@@ -148,7 +148,11 @@ jsDelivr 单文件限 20MB，v6 库约 37MB 会被拒，自动回退 GitHub。
 实测：`AS13335`（Cloudflare）展开网段→代表主机，逐个扫 443 并标注归属地正常。
 
 ## 发布
-Actions → Release → Run workflow，填版本号（如 v1.1.0），更新内容留空即自动取上个版本以来的提交说明，自动编译并发布到同名 Release。
+**打 tag 即自动发布**：推送 `v*` 版本的 tag 会自动触发 Release，编译并发布到同名 Release，说明自动取上一个 tag 以来的提交。
+
+    git tag v1.2 && git push origin v1.2
+
+Release 名称、产物版本号均取自 tag 名（如 `v1.2`），无需手动填版本号。
 
 构建目标共 18 个（`.github/workflows/release.yml`）：
 
