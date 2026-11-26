@@ -3,6 +3,17 @@
 // 用法:
 //
 //	nsnali [-s 223.5.5.5] [-t A,AAAA,CNAME,MX,NS,TXT] 域名...   // 解析并标注 IP 归属地
+//	nsnali -ping www.baidu.com                                    // 解析后对每个 IP 做 ICMP 探测
+//	nsnali -trace www.baidu.com                                   // 路由跟踪，每跳带归属地
+//	nsnali -mtr 8.8.8.8                                           // 持续路由探测（Ctrl+C 停止）
+//	nsnali -tcping -tcping-port 443 www.baidu.com                 // TCP 端口测延迟丢包
+//	nsnali -ptr 8.8.8.8                                           // IP 反查域名
+//	nsnali -asn 8.8.8.8                                           // ASN/运营商查询
+//	nsnali -whois github.com                                      // WHOIS 注册信息
+//	nsnali -cert www.baidu.com                                    // HTTPS 证书检查
+//	nsnali -scan -scan-ports 22,80,443 1.1.1.1                     // 端口扫描（单 IP）
+//	nsnali -scan -scan-ports 80,443 192.168.1.0/24                 // CIDR 段扫描
+//	nsnali -scan AS15169                                          // ASN 扫描（AS→网段→代表主机）
 //	dig www.qq.com | nsnali                                       // nali 模式：给文本里的 IP 加注释
 //	nsnali 8.8.8.8 240e::1                                        // 参数是 IP 时直接查归属地
 package main
@@ -74,9 +85,41 @@ func lookup(c *dns.Client, domain, server string, types []uint16) {
 			case *dns.CNAME:
 				line = fmt.Sprintf("CNAME:\t%s", strings.TrimSuffix(v.Target, "."))
 			case *dns.A:
-				line = fmt.Sprintf("Address: %s\t[%s]", v.A, region(v.A.String()))
+				ip := v.A.String()
+				line = fmt.Sprintf("Address: %s\t[%s]", ip, region(ip))
+				if asnEnabled {
+					line = appendASN(line, ip)
+				}
+				if ptrEnabled {
+					line = appendPTR(line, ip)
+				}
+				if pcfg.enabled {
+					line = appendPing(line, ip)
+				}
+				if tcfg.enabled {
+					line = appendTrace(line, ip)
+				}
+				if tcpcfg.enabled {
+					line = appendTCPing(line, ip)
+				}
 			case *dns.AAAA:
-				line = fmt.Sprintf("Address: %s\t[%s]", v.AAAA, region(v.AAAA.String()))
+				ip := v.AAAA.String()
+				line = fmt.Sprintf("Address: %s\t[%s]", ip, region(ip))
+				if asnEnabled {
+					line = appendASN(line, ip)
+				}
+				if ptrEnabled {
+					line = appendPTR(line, ip)
+				}
+				if pcfg.enabled {
+					line = appendPing(line, ip)
+				}
+				if tcfg.enabled {
+					line = appendTrace(line, ip)
+				}
+				if tcpcfg.enabled {
+					line = appendTCPing(line, ip)
+				}
 			case *dns.MX:
 				line = fmt.Sprintf("MX:\t%d %s", v.Preference, strings.TrimSuffix(v.Mx, "."))
 			case *dns.NS:
@@ -279,7 +322,45 @@ func main() {
 	update := flag.Bool("update", false, "重新下载 IP 库后退出")
 	noV6 := flag.Bool("no-v6", false, "不使用 IPv6 库（省去约 37MB 下载）")
 	mirror := flag.String("mirror", "", "自建 IP 库下载地址（目录 URL），优先于 jsDelivr")
+	doPing := flag.Bool("ping", false, "对解析出的 IP 执行 ICMP 探测并显示延迟/丢包")
+	pingCount := flag.Int("ping-count", 3, "每个 IP 的 ping 次数")
+	pingTimeout := flag.Duration("ping-timeout", 3*time.Second, "单次 ping 的超时")
+	doTrace := flag.Bool("trace", false, "路由跟踪（TTL 递增），每跳标注归属地，需 root/CAP_NET_RAW")
+	traceHop := flag.Int("trace-hop", 20, "trace 最大跳数")
+	traceTimeout := flag.Duration("trace-timeout", 1*time.Second, "trace 每跳等待超时")
+	doMTR := flag.Bool("mtr", false, "持续路由探测，累积每跳丢包/延迟统计，Ctrl+C 停止")
+	mtrHop := flag.Int("mtr-hop", 20, "mtr 最大跳数")
+	mtrCount := flag.Int("mtr-count", 3, "mtr 每跳每轮发包数")
+	mtrRounds := flag.Int("mtr-rounds", 0, "mtr 轮数，0 表示持续到 Ctrl+C")
+	mtrTimeout := flag.Duration("mtr-timeout", time.Second, "mtr 每跳等待超时")
+	doTCPing := flag.Bool("tcping", false, "用 TCP 连接测延迟/丢包（ICMP 被禁时可用）")
+	tcpPort := flag.Int("tcping-port", 80, "tcping 目标端口")
+	tcpCount := flag.Int("tcping-count", 4, "tcping 连接次数")
+	tcpTimeout := flag.Duration("tcping-timeout", 2*time.Second, "tcping 单次连接超时")
+	doPTR := flag.Bool("ptr", false, "对 IP 反查 PTR 域名")
+	doASN := flag.Bool("asn", false, "查询 IP 的 ASN/运营商信息（Team Cymru DNS）")
+	doWHOIS := flag.Bool("whois", false, "WHOIS 查询域名/IP 注册信息")
+	flag.BoolVar(&whoisFull, "whois-full", false, "WHOIS 显示原始全文")
+	doCert := flag.Bool("cert", false, "检查 HTTPS 证书（颁发者/有效期/TLS 版本）")
+	certPort := flag.Int("cert-port", 443, "证书检查端口")
+	certTimeout := flag.Duration("cert-timeout", 3*time.Second, "证书检查超时")
+	certInsecure := flag.Bool("cert-insecure", false, "证书检查跳过校验")
+	doScan := flag.Bool("scan", false, "端口扫描（目标支持 IP/CIDR/范围/ASN）")
+	scanPorts := flag.String("scan-ports", "21,22,23,25,53,80,110,143,443,445,993,995,1433,3306,3389,8080,8443", "扫描端口，逗号/范围")
+	scanConcurrency := flag.Int("scan-concurrency", 100, "扫描并发数")
+	scanTimeout := flag.Duration("scan-timeout", 800*time.Millisecond, "扫描单连接超时")
+	scanMaxHosts := flag.Int("scan-max-hosts", 256, "CIDR/ASN 最多展开主机数")
 	flag.Parse()
+
+	pcfg = pingConfig{enabled: *doPing, count: *pingCount, timeout: *pingTimeout}
+	tcfg = traceConfig{enabled: *doTrace, maxHop: *traceHop, probes: 2, timeout: *traceTimeout}
+	mcfg = mtrConfig{enabled: *doMTR, maxHop: *mtrHop, count: *mtrCount, rounds: *mtrRounds, timeout: *mtrTimeout}
+	tcpcfg = tcpingConfig{enabled: *doTCPing, port: *tcpPort, count: *tcpCount, timeout: *tcpTimeout}
+	certcfg = certConfig{enabled: *doCert, port: *certPort, timeout: *certTimeout, insecure: *certInsecure}
+	ptrEnabled = *doPTR
+	asnEnabled = *doASN
+	whoisEnabled = *doWHOIS
+	scfg = scanConfig{enabled: *doScan, ports: *scanPorts, concurrency: *scanConcurrency, timeout: *scanTimeout, maxHosts: *scanMaxHosts}
 
 	srcs := mirrorList(*mirror)
 	ensureDB(*v4db, "ip2region_v4.xdb", *update, srcs)
@@ -312,10 +393,65 @@ func main() {
 	fmt.Printf("Server:\t%s\t[%s]\n\n", srv, region(host))
 
 	c := &dns.Client{Timeout: *timeout}
+	dnsClient, dnsServer = c, srv
 	types := parseTypes(*qtypes)
 	for _, arg := range flag.Args() {
+		// mtr 是持续全屏模式，单独运行每个目标后跳过其它探测
+		if mcfg.enabled {
+			target := arg
+			if net.ParseIP(arg) == nil { // 域名：解析出首个 A 记录
+				ips := resolveA(arg)
+				if len(ips) == 0 {
+					fmt.Printf("mtr: 无法解析域名 %s 的 A 记录\n", arg)
+					continue
+				}
+				target = ips[0]
+			}
+			runMTR(target)
+			continue
+		}
+		// scan 独立模式（IP / CIDR / 范围 / ASN）
+		if scfg.enabled {
+			fmt.Println(runScan(arg))
+			continue
+		}
+		// tcping 独立模式（目标是域名时内部解析 A 记录）
+		if tcpcfg.enabled && !pcfg.enabled && !tcfg.enabled {
+			runTCPingOnly(arg)
+			fmt.Println()
+			continue
+		}
+		// whois 独立模式（对域名或 IP 查注册信息）
+		if whoisEnabled && !pcfg.enabled && !tcfg.enabled && !certcfg.enabled {
+			fmt.Println(appendWHOIS("", arg))
+			fmt.Println()
+			continue
+		}
+		// cert 独立模式（对域名/IP 检查证书）
+		if certcfg.enabled && !pcfg.enabled && !tcfg.enabled && !tcpcfg.enabled {
+			fmt.Println(certCheck(arg))
+			fmt.Println()
+			continue
+		}
 		if net.ParseIP(arg) != nil { // 参数本身是 IP，直接查归属地
-			fmt.Printf("%s\t[%s]\n\n", arg, region(arg))
+			line := fmt.Sprintf("%s\t[%s]", arg, region(arg))
+			if asnEnabled {
+				line = appendASN(line, arg)
+			}
+			if ptrEnabled {
+				line = appendPTR(line, arg)
+			}
+			if pcfg.enabled {
+				line = appendPing(line, arg)
+			}
+			if tcfg.enabled {
+				line = appendTrace(line, arg)
+			}
+			if tcpcfg.enabled {
+				line = appendTCPing(line, arg)
+			}
+			fmt.Println(line)
+			fmt.Println()
 			continue
 		}
 		lookup(c, arg, srv, types)
